@@ -4,6 +4,8 @@
 @Author  : qy
 @Date    : 2025/8/20 10:25
 """
+
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -12,21 +14,38 @@ import httpx
 import logging
 import json
 import uuid
-import asyncio
-from policy_utils import get_policy_info, parts, ori_data
-from prompt import build_policy_elements_prompt, build_company_judgment_prompt, empty_company_info_dict
 
+from policy_utils import get_policy_info
+from prompt import build_policy_elements_prompt, build_company_judgment_prompt, empty_company_info_dict
+from recods_info import save_record, load_records
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 API_URL = "https://mcc-pre.3xmt.com/gateway/ai-service/v1/chat/completions"
 API_KEY = "sk-bFcPcwS7J7oP6e8LGo"
 
 app = FastAPI()
 
-MAX_RECORDS_PER_COMPANY = 5
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有源，测试用
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+MAX_RECORDS_PER_COMPANY = 1000
 global_company_info: Dict[str, List[Dict[str, Any]]] = {}
 
+
+historical_records = load_records()
+for r in historical_records:
+    name = r["company_info"].get("name")
+    if name:
+        global_company_info.setdefault(name, []).append(r)
 
 def merge_company_info(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
     merged = old.copy()
@@ -53,7 +72,7 @@ class NewCheckRequest(BaseModel):
     messages: List[Message]
 
 
-async def stream_model_response(prompt: str, buffer_size: int = 20) -> AsyncGenerator[str, None]:
+async def stream_model_response(prompt: str, buffer_size: int = 10) -> AsyncGenerator[str, None]:
     """流式调用大模型，SSE 逐块返回 JSON，使用缓冲区收集输出直到达到指定长度"""
     payload = {
         "model": "deepseek-v3",
@@ -86,7 +105,7 @@ async def stream_model_response(prompt: str, buffer_size: int = 20) -> AsyncGene
                                 buffer = ""
                         finish_reason = data["choices"][0].get("finish_reason")
                         if finish_reason == "stop":
-                            if buffer:  # 输出剩余内容
+                            if buffer:
                                 yield json.dumps({"content": buffer}, ensure_ascii=False)
                             # 添加换行符作为第一个模型结束的标记
                             yield json.dumps({"content": "\n"}, ensure_ascii=False)
@@ -119,7 +138,7 @@ async def check_policy(req: NewCheckRequest):
         merged_info = merge_company_info(target_record["company_info"], company_info)
         merged_policy_info = merge_company_info(target_record.get("policy_info", {}), policy_info)
         new_uid = str(uuid.uuid4())
-        new_record = {
+        record = {
             "uid": new_uid,
             "part_id": req.part_id,
             "company_info": merged_info,
@@ -127,10 +146,13 @@ async def check_policy(req: NewCheckRequest):
         }
         if len(existing_records) >= MAX_RECORDS_PER_COMPANY:
             raise HTTPException(status_code=400, detail=f"该公司历史记录已达 {MAX_RECORDS_PER_COMPANY} 条")
-        global_company_info.setdefault(company_name, []).append(new_record)
+        global_company_info.setdefault(company_name, []).append(record)
+
+
     else:
         if len(existing_records) >= MAX_RECORDS_PER_COMPANY:
             raise HTTPException(status_code=400, detail=f"该公司历史记录已达 {MAX_RECORDS_PER_COMPANY} 条")
+
         base_info = existing_records[-1]["company_info"] if existing_records else empty_company_info_dict()
         merged_info = merge_company_info(base_info, company_info)
         new_uid = str(uuid.uuid4())
@@ -141,26 +163,32 @@ async def check_policy(req: NewCheckRequest):
             "policy_info": policy_info
         }
         global_company_info.setdefault(company_name, []).append(record)
+    save_record(record)
 
     policy_elements_prompt = build_policy_elements_prompt(req.part_id, policy_info)
     company_judgment_prompt = build_company_judgment_prompt(merged_info, policy_info)
 
-    # 定义两个部分的开头语
-    first_intro = "欢迎进入智能帮办环节，我可以为您提供智能匹配、智能体检、智能填报等环节的申报全流程智能辅助服务，您可以点击此处查看为您推荐的相关申报政策。您也可以直接告诉我想要申报的政策，由我提供智能体检服务。\n"
+    # 定义开头语
+    first_intro = "欢迎进入智能帮办环节，我可以为您提供智能匹配、智能体检、智能填报等环节的申报全流程智能辅助服务，您可以点击此处查看为您推荐的相关申报政策。您也可以直接告诉我想要申报的政策，由我提供智能体检服务。\n下面展示申请专项政策要素：\n"
     second_intro = "经AI对政策申报要求与贵司画像特征智能分析，您当前还不满足政策申报条件，还存在以下条件需要由您确认；\n"
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        # 输出第一轮开头语
-        yield f"data: {json.dumps({'content': first_intro}, ensure_ascii=False)}\n\n"
 
-        # 输出第一个模型的结果（带缓冲）
+        # 第一轮开头语
+        yield f"data: {json.dumps({'content': first_intro}, ensure_ascii=False)}\n\n"
+        # 第一个模型的结果
         async for chunk in stream_model_response(policy_elements_prompt):
             yield f"data: {chunk}\n\n"
 
-        # 输出第二轮开头语
-        yield f"data: {json.dumps({'content': second_intro}, ensure_ascii=False)}\n\n"
 
-        # 输出第二个模型的结果（带缓冲）
+        newline = '\n'
+        data_dict = {'content': newline}
+        yield f"data: {json.dumps(data_dict, ensure_ascii=False)}\n"
+
+
+        # 第二轮开头语
+        yield f"data: {json.dumps({'content': second_intro}, ensure_ascii=False)}\n\n"
+        #第二个模型结果
         async for chunk in stream_model_response(company_judgment_prompt):
             yield f"data: {chunk}\n\n"
 
@@ -173,4 +201,4 @@ async def check_policy(req: NewCheckRequest):
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run("demo-ds-v3:app", host="0.0.0.0", port=8500, reload=True)
+    uvicorn.run(app="demo-ds-v3:app",workers=4, host="0.0.0.0", port=8500, reload=False)
