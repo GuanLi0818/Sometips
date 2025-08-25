@@ -55,15 +55,13 @@ def merge_company_info(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
 
 
 class Message(BaseModel):
-    role: str
-    content: str
-    metadata: Dict[str, Any]
+    company_info: Dict[str, Any]
 
 
 class NewCheckRequest(BaseModel):
     part_id: str
     uid: Optional[str] = None
-    messages: List[Message]
+    metadata: List[Message]
 
 
 # ------------------- 模型流 -------------------
@@ -146,7 +144,7 @@ async def chunked_response(generator: AsyncGenerator[Dict[str, Any], None]):
 # ------------------- check_policy endpoint -------------------
 @app.post("/check_policy")
 async def check_policy(req: NewCheckRequest):
-    company_info = req.messages[0].metadata.get("company_info", {})
+    company_info = req.metadata[0].company_info
     policy_info = get_policy_info(req.part_id)
     if "error" in policy_info:
         raise HTTPException(status_code=404, detail='未找到该申报专项政策')
