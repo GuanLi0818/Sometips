@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-@File    : 1_json_chunk.py
+@File    : main16.py
 @Author  : qy
 @Date    : 2025/8/22 18:27
 """
-from fastapi.middleware.cors import CORSMiddleware
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, AsyncGenerator
@@ -61,7 +61,7 @@ class Message(BaseModel):
 class NewCheckRequest(BaseModel):
     part_id: str
     uid: Optional[str] = None
-    metadata: List[Message]
+    metadata: Dict[str, Any]
 
 
 # ------------------- 模型流 -------------------
@@ -125,7 +125,7 @@ async def chunked_response(generator: AsyncGenerator[Dict[str, Any], None]):
     async def iterate():
         async for text_dict in generator:
             text_bytes = json.dumps(text_dict, ensure_ascii=False).encode("utf-8")
-            output = b"data:" + text_bytes + b"\n\n" + b"\r\n"
+            output = b"data:" + text_bytes + b"\n\n"
 
             size = len(output) - 2
             size_hex = hex(size)[2:].encode("ascii") + b"\r\n"
@@ -144,7 +144,7 @@ async def chunked_response(generator: AsyncGenerator[Dict[str, Any], None]):
 # ------------------- check_policy endpoint -------------------
 @app.post("/check_policy")
 async def check_policy(req: NewCheckRequest):
-    company_info = req.metadata[0].company_info
+    company_info = req.metadata["company_info"]
     policy_info = get_policy_info(req.part_id)
     if "error" in policy_info:
         raise HTTPException(status_code=404, detail='未找到该申报专项政策')
@@ -249,7 +249,7 @@ async def check_policy(req: NewCheckRequest):
             if chunk is None:
                 break
             yield {
-                "id": session_id,
+                "session_id": session_id,
                 "model": "deepseek-v3",
                 "created": created_ts,
                 "part_id": req.part_id,
@@ -268,7 +268,7 @@ async def check_policy(req: NewCheckRequest):
 
         # 空行分隔
         yield {
-            "id": session_id,
+            "session_id": session_id,
             "model": "deepseek-v3",
             "created": created_ts,
             "part_id": req.part_id,
@@ -294,7 +294,7 @@ async def check_policy(req: NewCheckRequest):
                 break
             last_chunk = chunk
             yield {
-                "id": session_id,
+                "session_id": session_id,
                 "model": "deepseek-v3",
                 "created": created_ts,
                 "part_id": req.part_id,
@@ -314,7 +314,7 @@ async def check_policy(req: NewCheckRequest):
         # 最后一个 chunk finish_reason="stop"
         if last_chunk is not None:
             yield {
-                "id": session_id,
+                "session_id": session_id,
                 "model": "deepseek-v3",
                 "created": created_ts,
                 "part_id": req.part_id,
