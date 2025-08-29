@@ -22,7 +22,7 @@ def save_record(record: dict):
     except Exception as e:
         logger.error(f"保存记录失败: {e}")
 
-def load_records() -> list:
+def load_record() -> list:
     """启动时从文件恢复数据，返回列表"""
     records = []
     if os.path.exists(DATA_FILE):

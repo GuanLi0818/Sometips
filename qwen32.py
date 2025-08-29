@@ -27,13 +27,12 @@ from prompt import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-API_URL = "https://mcc-pre.3xmt.com/gateway/ai-service/v1/chat/completions"
-API_KEY = "sk-bFcPcwS7J7oP6e8LGo"
-
+API_URL = "http://192.168.2.233:58000/v1/chat/completions"
 SESSIONS_FILE = "sessions.json"
 MAX_RECORDS = 10
 EXPIRY_HOURS = 5
 
+# -------------------------- 请求/响应模型 --------------------------
 class NewCheckRequest(BaseModel):
     part_id: str
     metadata: CompanyInfo
@@ -46,7 +45,6 @@ class PolicyStreamResponse(BaseModel):
     created: int
     part_id: str
     choices: List[Dict[str, Any]]
-
 
 # -------------------------- Session 存储与清理 --------------------------
 def load_sessions() -> Dict[str, Any]:
@@ -95,6 +93,8 @@ def save_session_record(session_id: str, merged_info: str, part_id: str):
     session["last_update"] = now
     save_sessions(sessions)
 
+
+
 def check_first_output_done(session_id: str, part_id: str) -> bool:
     sessions = load_sessions()
     for rec in sessions.get(session_id, {}).get("records", []):
@@ -117,7 +117,7 @@ def cleanup_sessions(sessions: Optional[Dict[str, Any]] = None):
 async def periodic_cleanup(interval_hours: float = 1):
     while True:
         cleanup_sessions()
-        await asyncio.sleep(interval_hours * 3600)  # 每小时执行一次
+        await asyncio.sleep(interval_hours * 3600)
 
 # -------------------------- FastAPI lifespan --------------------------
 @asynccontextmanager
@@ -127,17 +127,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
-# -------------------------- 大模型调用 --------------------------
-async def stream_model_response(prompt: str, buffer_size: int = 2, flush_interval: float = 0.05) -> AsyncGenerator[str, None]:
+# -------------------------- 模型调用函数 --------------------------
+async def stream_model_response(prompt: str, buffer_size: int = 2, flush_interval: float = 0.04) -> AsyncGenerator[str, None]:
     payload = {
-        "model": "deepseek-v3",
+        "model": "qwen3_32b",
         "messages": [{"role": "user", "content": prompt}],
+        "chat_template_kwargs": {"enable_thinking": False},
+        "temperature": 0.6,
+        "top_k": 50,
         "stream": True
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}"
     }
     buffer = ""
     finished = False
@@ -146,7 +144,7 @@ async def stream_model_response(prompt: str, buffer_size: int = 2, flush_interva
         nonlocal buffer, finished
         try:
             async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("POST", API_URL, json=payload, headers=headers) as response:
+                async with client.stream("POST", API_URL, json=payload) as response:
                     async for line_bytes in response.aiter_lines():
                         if not line_bytes or not line_bytes.startswith("data:"):
                             continue
@@ -158,8 +156,7 @@ async def stream_model_response(prompt: str, buffer_size: int = 2, flush_interva
                             delta = data["choices"][0]["delta"].get("content", "")
                             if delta:
                                 buffer += delta
-                            finish_reason = data["choices"][0].get("finish_reason")
-                            if finish_reason == "stop":
+                            if data["choices"][0].get("finish_reason") == "stop":
                                 finished = True
                                 break
                         except json.JSONDecodeError:
@@ -169,7 +166,6 @@ async def stream_model_response(prompt: str, buffer_size: int = 2, flush_interva
             finished = True
 
     fetch_task = asyncio.create_task(fetch_model())
-
     try:
         while not finished or buffer:
             if buffer:
@@ -187,6 +183,7 @@ async def collect_model_output(prompt: str) -> str:
         result += chunk
     return result.strip()
 
+# -------------------------- 工具函数 --------------------------
 def remove_empty_values(data: Dict[str, Any]) -> Dict[str, Any]:
     cleaned_data = {}
     for key, value in data.items():
@@ -199,16 +196,15 @@ def remove_empty_values(data: Dict[str, Any]) -> Dict[str, Any]:
         cleaned_data[key] = value
     return cleaned_data
 
+# -------------------------- SSE流式响应 --------------------------
 async def chunked_response(generator: AsyncGenerator[Dict[str, Any], None]):
     async def iterate():
-        async for text_dict in generator:
-            text_bytes = json.dumps(text_dict, ensure_ascii=False).encode("utf-8")
-            output = b"data:" + text_bytes + b"\n\n"
-            yield output
+        async for resp_dict in generator:
+            resp_bytes = json.dumps(resp_dict, ensure_ascii=False).encode("utf-8")
+            yield b"data:" + resp_bytes + b"\n\n"
     return StreamingResponse(iterate(), media_type="text/event-stream")
 
-
-# -------------------------- API --------------------------
+# -------------------------- 核心接口 --------------------------
 @app.post("/check_policy")
 async def check_policy(req: NewCheckRequest):
     current_time = time.time()
@@ -228,19 +224,6 @@ async def check_policy(req: NewCheckRequest):
         stream_id = str(uuid.uuid4())
         created_ts = int(time.time())
         first_output_done = check_first_output_done(session_id, req.part_id)
-
-        #标记
-        yield PolicyStreamResponse(
-            id=stream_id,
-            model="deepseek-v3",
-            created=created_ts,
-            part_id=req.part_id,
-            choices=[{
-                "index": -1,
-                "finish_reason": None,
-                "message": {"content": "", "role": "assistant"}
-            }],
-        ).dict() | {"first_chunk": True}
 
         elem_queue: asyncio.Queue[str] = asyncio.Queue()
         judge_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -301,7 +284,7 @@ async def check_policy(req: NewCheckRequest):
             judge_prompt = build_company_judgment_prompt(cleaned_info, policy_info)
             await model_to_queue(judge_prompt, judge_queue)
 
-        # judge_task = asyncio.create_task(run_judgment())
+        judge_task = asyncio.create_task(run_judgment())
 
         async def typing_output(text: str) -> AsyncGenerator[Dict[str, Any], None]:
             nonlocal choice_index
@@ -309,7 +292,7 @@ async def check_policy(req: NewCheckRequest):
                 chunk_text = text[i:i + 2]
                 yield PolicyStreamResponse(
                     id=stream_id,
-                    model="deepseek-v3",
+                    model="qwen3_32b",
                     created=created_ts,
                     part_id=req.part_id,
                     choices=[{
@@ -337,7 +320,7 @@ async def check_policy(req: NewCheckRequest):
                     break
                 yield PolicyStreamResponse(
                     id=stream_id,
-                    model="deepseek-v3",
+                    model="qwen3_32b",
                     created=created_ts,
                     part_id=req.part_id,
                     choices=[{
@@ -351,20 +334,13 @@ async def check_policy(req: NewCheckRequest):
             save_session_record(session_id, "", req.part_id)
 
         # ---------- 后续输出 ----------
-        # ---------- 后续输出 ----------
         second_intro = (
             "经AI对政策申报要求与贵司画像特征智能分析，您当前还不满足政策申报条件，"
-            "可能还存在以下条件需要由您确认：\n"
+            "还存在以下条件需要由您确认：\n"
         )
-
-        # 在后台启动标准化和判断
-        judge_task = asyncio.create_task(run_judgment())
-
-        # 输出开头语
         async for chunk in typing_output(second_intro):
             yield chunk
 
-        # 开头语输出完毕，立即输出判断结果
         last_judge_chunk = None
         while True:
             judge_chunk = await judge_queue.get()
@@ -373,7 +349,7 @@ async def check_policy(req: NewCheckRequest):
             last_judge_chunk = judge_chunk
             yield PolicyStreamResponse(
                 id=stream_id,
-                model="deepseek-v3",
+                model="qwen3_32b",
                 created=created_ts,
                 part_id=req.part_id,
                 choices=[{
@@ -384,11 +360,10 @@ async def check_policy(req: NewCheckRequest):
             ).dict()
             choice_index += 1
 
-        # 最后标记 finish
         if last_judge_chunk is not None:
             yield PolicyStreamResponse(
                 id=stream_id,
-                model="deepseek-v3",
+                model="qwen3_32b",
                 created=created_ts,
                 part_id=req.part_id,
                 choices=[{
@@ -404,4 +379,4 @@ async def check_policy(req: NewCheckRequest):
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app="main17:app", workers=1, host="0.0.0.0", port=8001, reload=False)
+    uvicorn.run(app="qwen32:app", workers=1, host="0.0.0.0", port=8001, reload=False)
