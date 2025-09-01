@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>政策智能体检测试</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .container { max-width: 800px; margin: auto; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input, textarea, button { width: 100%; padding: 8px; box-sizing: border-box; }
+        textarea { height: 100px; resize: vertical; }
+        button { background-color: #007bff; color: white; border: none; cursor: pointer; }
+        #output { margin-top: 20px; border: 1px solid #ccc; padding: 10px; background-color: #f9f9f9; white-space: pre-wrap; word-wrap: break-word; min-height: 200px;}
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>政策智能体检前端测试</h1>
+
+    <div class="form-group">
+        <label for="session_id">会话ID (Session ID)</label>
+        <input type="text" id="session_id" placeholder="将自动生成和保存">
+        <button onclick="generateSessionId()" style="width: auto; padding: 5px 10px; margin-top: 5px;">生成新ID</button>
+    </div>
+
+    <div class="form-group">
+        <label for="part_id">政策ID (part_id)</label>
+        <input type="text" id="part_id" value="ZXZC037"> <!-- 更新为之前测试数据使用的ID -->
+    </div>
+
+    <div class="form-group">
+        <label for="metadata">公司基础信息 (metadata - JSON格式)</label>
+        <textarea id="metadata">{
+    "name": "上海瑞影科技有限公司",
+    "org": "有限责任公司",
+    "cap": "民营企业",
+    "size": "中型企业",
+    "description": "一家专注于医疗器械研发的创新型公司，致力于超声脉冲回波成像技术。",
+    "establish_time": "2024-07-08",
+    "regist_loc": "上海市_浦东新区",
+    "tax_loc": "上海市_浦东新区",
+    "person_size": 250,
+    "cap_size": 1200.0,
+    "credit_code": "913101096711196009",
+    "industry": [
+      "科学研究和技术服务业",
+      "医疗器械制造"
+    ],
+    "r_d_staff_count": 80,
+    "revenue_last_year": 5000.0,
+    "total_profit_last_year": 800.0
+}</textarea>
+    </div>
+
+    <div class="form-group">
+        <label for="user_input">补充信息 (user_input_text - 可选)</label>
+        <textarea id="user_input" placeholder="例如：我们去年营收800万，有5个发明专利。">我们公司在人工智能医疗影像方面有领先技术，去年研发投入达到1000万元。</textarea>
+    </div>
+
+    <button onclick="startCheck()">开始体检</button>
+
+    <h2>流式输出结果:</h2>
+    <div id="output"></div>
+</div>
+
+<script>
+    // 页面加载时，尝试从浏览器本地存储中获取 session_id
+    window.onload = function() {
+        const savedSessionId = localStorage.getItem('policy_check_session_id');
+        if (savedSessionId) {
+            document.getElementById('session_id').value = savedSessionId;
+        } else {
+            generateSessionId();
+        }
+    };
+
+    function generateSessionId() {
+        const newSessionId = 'session-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+        document.getElementById('session_id').value = newSessionId;
+        localStorage.setItem('policy_check_session_id', newSessionId);
+    }
+
+    let eventSource;
+
+    function startCheck() {
+        if (eventSource) {
+            eventSource.close(); // 如果有正在进行的连接，先关闭它
+        }
+
+        const sessionId = document.getElementById('session_id').value;
+        const partId = document.getElementById('part_id').value;
+        const metadataText = document.getElementById('metadata').value;
+        const userInput = document.getElementById('user_input').value;
+        const outputDiv = document.getElementById('output');
+
+        if (!sessionId || !partId) {
+            alert('Session ID 和 Part ID 不能为空！');
+            return;
+        }
+
+        let metadata;
+        try {
+            metadata = JSON.parse(metadataText);
+        } catch (e) {
+            alert('公司基础信息 (metadata) 不是有效的 JSON 格式！');
+            return;
+        }
+
+        // 清空上次的输出
+        outputDiv.innerHTML = "正在连接服务器，请稍候...";
+
+        const requestBody = {
+            session_id: sessionId,
+            part_id: partId,
+            metadata: metadata,
+            user_input_text: userInput
+        };
+        
+        const apiUrl = 'http://127.0.0.1:8002/check_policy';
+
+        fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(requestBody)
+        })
+        .then(response => {
+            outputDiv.innerHTML = ""; // 清空提示信息，准备接收数据
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+
+            function readStream() {
+                reader.read().then(({ done, value }) => {
+                    if (done) {
+                        console.log('Stream finished.');
+                        return;
+                    }
+
+                    const chunk = decoder.decode(value, { stream: true });
+                    const lines = chunk.split('\n\n');
+                    lines.forEach(line => {
+                        if (line.startsWith('data:')) {
+                            const jsonData = line.substring(5);
+                            try {
+                                const data = JSON.parse(jsonData);
+                                const content = data.choices[0].message.content;
+                                if (content) {
+                                    outputDiv.textContent += content;
+                                }
+                                if (data.choices[0].finish_reason === 'stop') {
+                                    outputDiv.textContent += "\n\n--- [对话结束] ---";
+                                }
+                            } catch (e) {
+                                // 忽略解析失败的非完整 JSON
+                                console.warn("Failed to parse SSE data chunk:", jsonData, e);
+                            }
+                        }
+                    });
+
+                    // 继续读取下一块数据
+                    readStream();
+                });
+            }
+            readStream();
+        })
+        .catch(error => {
+            outputDiv.innerHTML = '连接失败: ' + error;
+            console.error('Error:', error);
+        });
+    }
+
+</script>
+
+</body>
+</html>
