@@ -22,12 +22,12 @@ class CompanyInfo(BaseModel):
     tax_loc: Optional[str] = Field(None, description="税收户管地")
     person_size: Optional[int] = Field(None, description="企业员工人数")
     cap_size: Optional[float] = Field(None, description="企业注册资金（万元）")
-    credit_rating: Optional[str] = Field(None, description="企业信用等级")
+    credit_rating: Optional[List[str]] = Field(default_factory=list, description="企业信用等级")
     credit_code : Optional[str] =Field(None, description="统一社会信用代码")
 
 
     industry: Optional[List[str]] = Field(default_factory=list, description="所属行业")
-    primary_product: Optional[List[str]] = Field(None, description="主营业务")
+    primary_product: Optional[List[str]] = Field(default_factory=list, description="主营业务")
     key_focus_areas: Optional[List[str]] = Field(default_factory=list, description="重点领域")
     honors: Optional[List[str]] = Field(default_factory=list, description="荣誉资质")
     qualifications: Optional[List[str]] = Field(default_factory=list, description="企业资质")
