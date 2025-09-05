@@ -72,25 +72,26 @@ def build_policy_elements_prompt(part_id: str, policy_info: Dict[str, Any]) -> s
         """
     return prompt
 
-def build_company_judgment_prompt(company_info: Dict[str, Any], policy_info: Dict[str, Any]) -> str:
+def build_company_judgment_prompt(company_info: Dict[str, Any], policy_info: Dict[str, Any], extra_user_inputs: str = "") -> str:
     company_info_text = "\n".join(f"{k}: {v}" for k, v in company_info.items())
     policy_text_lines = [f"{k}: {v}" for k, v in policy_info.items()]
     policy_text = "\n".join(policy_text_lines)
+
     prompt = f"""
         你是一位精通政府政策解读和企业合规分析的专家。
         你的任务是根据企业信息和政策条款，判断企业是否符合申报条件，只输出“不满足/不确定”的条件及简短建议，不生成其他内容。
-
+        
         要求：
         1. 申报对象：重点关注字段：org、cap、size、regist_loc、tax_loc、description、extra_fields 等。
-        2. 扶持领域：重点关注字段：key_focus_areas、industry、description、primary_product、tags、honors 、extra_fields等。
+        2. 扶持领域：重点关注字段：key_focus_areas、industry、description、primary_product、tags、honors、extra_fields 等。
         3. 申报条件：逐条对照政策条款的申报条件，结合企业所有信息判断。
-        4. 政策条款中{policy_text}的“申报对象”、“扶持领域”、“申报条件”三项必须都要判断，若某一项为空或无内容，则默认满足该项。
+        4. 政策条款中 {policy_text} 的“申报对象”、“扶持领域”、“申报条件”三项必须都要判断，若某一项为空或无内容，则默认满足该项。
         5. 输出为纯文本，不要 JSON，也不要勾选框或符号。
         6. 每条条件一句话，直接描述问题。
         7. 控制总输出长度，语言一定要简洁，要控制输出字数。
-        8. 列出所有不满足的条件，没有就不写，给出简要的建议。
-        9. 列出所有不确定的条件，没有就不写，给出简要的建议。
-        10. 不要生成企业信息字段名（如 regit_loc、tax_loc、industry 等）。
+        8. 列出所有不满足的条件，没有就不写。
+        9. 列出所有不确定的条件，没有就不写。
+        10. 不要生成企业信息字段名（如 regist_loc、tax_loc、industry 等）。
         11. 如果公司信息中未明确以下信息，就默认为满足项，就不用输出和建议：
             企业内部治理结构规范性、
             企业财务管理制度健全性、
@@ -105,24 +106,40 @@ def build_company_judgment_prompt(company_info: Dict[str, Any], policy_info: Dic
             3. 不要保守输出“不满足项”，除非确实缺少信息。
         13. 当用户输入的时间、行为、对象满足政策要求时间段时，判断为满足，不要保守输出不满足项。
         14. tags 中的内容也视为有效补充信息，可用于满足政策要求。
-
-
+        15. 输出规则：
+            - 如果存在不满足或不确定的条件，则输出对应内容。
+            - 如果所有条件都满足，则输出：
+                不满足项：无
+                不确定项：无
+                
+            - 不要输出其他任何前缀或说明文字。
+        
         政策条款：
         {policy_text}
-
+        
         企业信息：
         {company_info_text}
-
+        
+        用户原始输入（仅供参考）：
+        {extra_user_inputs}
+        
         请生成最终输出示例如下风格：
         不满足项：
         1. 企业所在行业是否为高端智能装备领域。
         2. 是否在2024年期间完成上海市级政策支持高端智能装备首台套突破项目验收。
-        3. 市级扶持资金是否已拨付到位。
+        3. 。。。
+        
         不确定项：
-        1. ...
-        2. ...
+        1. 是否符合其他地方专项资金支持条件。
+        2. 是否存在尚未披露的股权结构情况。
+        
+        或在全部满足时：
+        不满足项：无
+        
+        不确定项：无
         """
     return prompt
+
 
 def build_company_standardization_prompt(user_input: str) -> str:
     """
