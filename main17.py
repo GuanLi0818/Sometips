@@ -31,8 +31,8 @@ API_URL = "https://mcc-pre.3xmt.com/gateway/ai-service/v1/chat/completions"
 API_KEY = "sk-bFcPcwS7J7oP6e8LGo"
 
 SESSIONS_FILE = "sessions.json"
-MAX_RECORDS = 10
-EXPIRY_HOURS = 5
+MAX_RECORDS = 20
+EXPIRY_HOURS = 1
 
 class NewCheckRequest(BaseModel):
     part_id: str
@@ -62,14 +62,9 @@ def save_sessions(sessions: Dict[str, Any]):
     with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(sessions, f, ensure_ascii=False, indent=2)
 
-def save_session_record(session_id: str, merged_info: str, part_id: str):
-    """
-    保存用户每次更新的合并信息。
-    首次出现该 part_id 的记录 first_output_done=True，后续更新记录 first_output_done=False
-    """
+def save_session_record(session_id: str, merged_info: str, part_id: str,user_input_text: Optional[str] = None):
     if not merged_info:
-        return  # 空内容不保存
-
+        return
     now = time.time()
     sessions = load_sessions()
     cleanup_sessions(sessions)
@@ -77,21 +72,17 @@ def save_session_record(session_id: str, merged_info: str, part_id: str):
         sessions[session_id] = {"records": [], "last_update": now}
     session = sessions[session_id]
 
-    # 判断该 part_id 是否首次出现
     first_done = not any(rec["part_id"] == part_id for rec in session["records"])
 
-    # 添加记录
     session["records"].append({
         "role": "user",
+        "user_input_text": user_input_text,
         "content": merged_info,
         "part_id": part_id,
         "first_output_done": first_done
     })
-
-    # 限制最大记录数
     if len(session["records"]) > MAX_RECORDS:
         session["records"] = session["records"][-MAX_RECORDS:]
-
     session["last_update"] = now
     save_sessions(sessions)
 
@@ -124,7 +115,6 @@ async def periodic_cleanup(interval_hours: float = 1):
 async def lifespan(app: FastAPI):
     asyncio.create_task(periodic_cleanup(interval_hours=1))
     yield
-
 app = FastAPI(lifespan=lifespan)
 
 
@@ -181,6 +171,7 @@ async def stream_model_response(prompt: str, buffer_size: int = 2, flush_interva
         fetch_task.cancel()
         await asyncio.sleep(0)
 
+#调用大模型标准化公司信息
 async def collect_model_output(prompt: str) -> str:
     result = ""
     async for chunk in stream_model_response(prompt, buffer_size=64, flush_interval=0.02):
@@ -211,13 +202,20 @@ async def chunked_response(generator: AsyncGenerator[Dict[str, Any], None]):
 # -------------------------- API --------------------------
 @app.post("/check_policy")
 async def check_policy(req: NewCheckRequest):
-    current_time = time.time()
+    """
+       核心接口：
+       1. 校验输入参数（必须有 session_id）
+       2. 根据 part_id 获取政策信息
+       3. 根据是否首次输出，生成政策要素、公司体检结果
+       4. 通过流式 SSE 返回
+       """
+
     if not req.session_id or not req.session_id.strip():
         raise HTTPException(status_code=400, detail="必须传入 session_id")
 
     policy_info = get_policy_info(req.part_id)
     if "error" in policy_info:
-        raise HTTPException(status_code=404, detail='未找到该申报专项政策')
+        raise HTTPException(status_code=404, detail='未找到该申报专项政策ID。')
 
     policy_elements_prompt = build_policy_elements_prompt(req.part_id, policy_info)
     session_id = req.session_id
@@ -256,7 +254,7 @@ async def check_policy(req: NewCheckRequest):
                 cleaned = remove_empty_values(merged_info)
                 logger.info(f"原始公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
                 save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
-                                    req.part_id)
+                                    req.part_id, req.user_input_text)
                 return cleaned
 
             std_prompt = build_company_standardization_prompt(req.user_input_text)
@@ -285,7 +283,7 @@ async def check_policy(req: NewCheckRequest):
                     merged_info[k] = v
             cleaned = remove_empty_values(merged_info)
             save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
-                                req.part_id)
+                                req.part_id,req.user_input_text)
             logger.info(f"送给大模型的公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
             return cleaned
 
@@ -298,10 +296,29 @@ async def check_policy(req: NewCheckRequest):
 
         async def run_judgment():
             cleaned_info = await std_task
-            judge_prompt = build_company_judgment_prompt(cleaned_info, policy_info)
+            sessions = load_sessions()
+            session = sessions.get(session_id, {})
+            records = session.get("records", [])
+            history_inputs = [
+                rec.get("user_input_text", "").strip()
+                for rec in records
+                if rec.get("user_input_text") and rec["part_id"] == req.part_id
+            ]
+            history_inputs = list(dict.fromkeys(history_inputs))
+
+            history_text = "\n".join(history_inputs)
+            print(f"=========== history_text======\n{history_text}")
+            print("===============================")
+
+            judge_prompt = build_company_judgment_prompt(
+                cleaned_info,
+                policy_info,
+                extra_user_inputs=history_text
+            )
+
             await model_to_queue(judge_prompt, judge_queue)
 
-        # judge_task = asyncio.create_task(run_judgment())
+        judge_task = asyncio.create_task(run_judgment())
 
         async def typing_output(text: str) -> AsyncGenerator[Dict[str, Any], None]:
             nonlocal choice_index
@@ -350,54 +367,62 @@ async def check_policy(req: NewCheckRequest):
 
             save_session_record(session_id, "", req.part_id)
 
-        # ---------- 后续输出 ----------
+
         # ---------- 后续输出 ----------
         second_intro = (
             "经AI对政策申报要求与贵司画像特征智能分析，您当前还不满足政策申报条件，"
             "可能还存在以下条件需要由您确认：\n"
         )
 
-        # 在后台启动标准化和判断
-        judge_task = asyncio.create_task(run_judgment())
 
         # 输出开头语
         async for chunk in typing_output(second_intro):
             yield chunk
 
-        # 开头语输出完毕，立即输出判断结果
-        last_judge_chunk = None
-        while True:
-            judge_chunk = await judge_queue.get()
-            if judge_chunk is None:
-                break
-            last_judge_chunk = judge_chunk
-            yield PolicyStreamResponse(
-                id=stream_id,
-                model="deepseek-v3",
-                created=created_ts,
-                part_id=req.part_id,
-                choices=[{
-                    "index": choice_index,
-                    "finish_reason": None,
-                    "message": {"content": judge_chunk, "role": "assistant"}
-                }]
-            ).dict()
-            choice_index += 1
+            # 第二个缓冲区：收集大模型完整输出
+            judge_buffer = ""
 
-        # 最后标记 finish
-        if last_judge_chunk is not None:
+            while True:
+                judge_chunk = await judge_queue.get()
+                if judge_chunk is None:
+                    break
+                judge_buffer += judge_chunk
+                yield PolicyStreamResponse(
+                    id=stream_id,
+                    model="qwen3_32b",
+                    created=created_ts,
+                    part_id=req.part_id,
+                    choices=[{
+                        "index": choice_index,
+                        "finish_reason": None,
+                        "message": {"content": judge_chunk, "role": "assistant"}
+                    }]
+                ).dict()
+                choice_index += 1
+
+            # 解析 judge_buffer，判断是否全部满足
+            is_satisfied = False
+            # 清洗
+            normalized = judge_buffer.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
+
+            if "不满足项：无" in normalized and "不确定项：无" in normalized:
+                is_satisfied = True
+
             yield PolicyStreamResponse(
                 id=stream_id,
-                model="deepseek-v3",
+                model="qwen3_32b",
                 created=created_ts,
                 part_id=req.part_id,
                 choices=[{
                     "index": choice_index,
                     "finish_reason": "stop",
-                    "message": {"content": "", "role": "assistant"}
+                    "message": {
+                        "content": "",
+                        "role": "assistant",
+                        "is_satisfied": str(is_satisfied).lower()
+                    }
                 }]
             ).dict()
-            choice_index += 1
 
     return await chunked_response(event_stream())
 
