@@ -37,9 +37,11 @@ EXPIRY_HOURS = 1
 # -------------------------- 请求/响应模型 --------------------------
 class NewCheckRequest(BaseModel):
     part_id: str
+    session_id: str
     metadata: CompanyInfo
     user_input_text: Optional[str] = None
-    session_id: str
+    check_mode: int = 1
+
 
 class PolicyStreamResponse(BaseModel):
     id: str
@@ -207,163 +209,195 @@ async def chunked_response(generator: AsyncGenerator[Dict[str, Any], None]):
 # -------------------------- 核心接口 --------------------------
 @app.post("/check_policy")
 async def check_policy(req: NewCheckRequest):
-    if not req.session_id or not req.session_id.strip():
-        raise HTTPException(status_code=400, detail="必须传入 session_id")
+    if req.check_mode == 1:
+        if not req.session_id or not req.session_id.strip():
+            raise HTTPException(status_code=400, detail="必须传入 session_id")
 
-    policy_info = get_policy_info(req.part_id)
-    if "error" in policy_info:
-        raise HTTPException(status_code=404, detail='未找到该申报专项政策ID。')
+        policy_info = get_policy_info(req.part_id)
+        if "error" in policy_info:
+            raise HTTPException(status_code=404, detail='未找到该申报专项政策ID。')
 
-    policy_elements_prompt = build_policy_elements_prompt(req.part_id, policy_info)
-    session_id = req.session_id
-    choice_index = 0
+        policy_elements_prompt = build_policy_elements_prompt(req.part_id, policy_info)
+        session_id = req.session_id
+        choice_index = 0
 
-    async def event_stream() -> AsyncGenerator[Dict[str, Any], None]:
-        nonlocal choice_index
-        stream_id = str(uuid.uuid4())
-        created_ts = int(time.time())
-        first_output_done = check_first_output_done(session_id, req.part_id)
+        async def event_stream() -> AsyncGenerator[Dict[str, Any], None]:
+            nonlocal choice_index
+            stream_id = str(uuid.uuid4())
+            created_ts = int(time.time())
+            first_output_done = check_first_output_done(session_id, req.part_id)
 
-        yield PolicyStreamResponse(
-            id=stream_id,
-            model="qwen3_32b",
-            created=created_ts,
-            part_id=req.part_id,
-            choices=[{
-                "index": -1,
-                "finish_reason": None,
-                "message": {"content": "", "role": "assistant"}
-            }],
-        ).dict() | {"first_chunk": True}
+            yield PolicyStreamResponse(
+                id=stream_id,
+                model="qwen3_32b",
+                created=created_ts,
+                part_id=req.part_id,
+                choices=[{
+                    "index": -1,
+                    "finish_reason": None,
+                    "message": {"content": "", "role": "assistant"}
+                }],
+            ).dict() | {"first_chunk": True}
 
-        elem_queue: asyncio.Queue[str] = asyncio.Queue()
-        judge_queue: asyncio.Queue[str] = asyncio.Queue()
+            elem_queue: asyncio.Queue[str] = asyncio.Queue()
+            judge_queue: asyncio.Queue[str] = asyncio.Queue()
 
-        async def model_to_queue(prompt: str, queue: asyncio.Queue):
-            async for chunk in stream_model_response(prompt):
-                await queue.put(chunk)
-            await queue.put(None)
+            async def model_to_queue(prompt: str, queue: asyncio.Queue):
+                async for chunk in stream_model_response(prompt):
+                    await queue.put(chunk)
+                await queue.put(None)
 
-        async def run_standardization() -> Dict[str, Any]:
-            sessions = load_sessions()
-            session = sessions.get(session_id, {})
-            records = session.get("records", [])
+            async def run_standardization() -> Dict[str, Any]:
+                sessions = load_sessions()
+                session = sessions.get(session_id, {})
+                records = session.get("records", [])
 
-            if records:
-                try:
-                    last_record = next(
-                        rec for rec in reversed(records) if rec.get("content")
-                    )
-                    merged_info = json.loads(last_record["content"])
-                except Exception:
+                if records:
+                    try:
+                        last_record = next(
+                            rec for rec in reversed(records) if rec.get("content")
+                        )
+                        merged_info = json.loads(last_record["content"])
+                    except Exception:
+                        merged_info = req.metadata.dict().copy()
+                else:
                     merged_info = req.metadata.dict().copy()
-            else:
-                merged_info = req.metadata.dict().copy()
 
-            if not req.user_input_text or not req.user_input_text.strip():
+                if not req.user_input_text or not req.user_input_text.strip():
+                    cleaned = remove_empty_values(merged_info)
+                    logger.info(f"当前公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
+                    save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
+                                        req.part_id,user_input_text=req.user_input_text)
+                    return cleaned
+
+                std_prompt = build_company_standardization_prompt(req.user_input_text)
+                std_result = await collect_model_output(std_prompt)
+
+                new_data = {}
+                for line in std_result.splitlines():
+                    line = line.strip()
+                    if not line or '": ' not in line:
+                        continue
+                    key_part, value_part = line.split('": ', 1)
+                    key = key_part.strip('"')
+                    value_str = value_part.strip().rstrip(',').strip()
+                    if value_str.startswith("[") and value_str.endswith("]"):
+                        try:
+                            value = [v.strip().strip('"') for v in value_str[1:-1].split(",")]
+                        except:
+                            value = value_str
+                    else:
+                        value = value_str.strip('"')
+                    new_data[key] = value
+
+                for k, v in new_data.items():
+                    if k in merged_info and isinstance(merged_info[k], list) and isinstance(v, list):
+                        merged_info[k] = list(dict.fromkeys(merged_info[k] + v))
+                    else:
+                        merged_info[k] = v
+
                 cleaned = remove_empty_values(merged_info)
-                logger.info(f"当前公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
+
                 save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
-                                    req.part_id,user_input_text=req.user_input_text)
+                                    req.part_id,req.user_input_text)
+                logger.info(f"送给大模型的公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
                 return cleaned
 
-            std_prompt = build_company_standardization_prompt(req.user_input_text)
-            std_result = await collect_model_output(std_prompt)
+            std_task = asyncio.create_task(run_standardization())
 
-            new_data = {}
-            for line in std_result.splitlines():
-                line = line.strip()
-                if not line or '": ' not in line:
-                    continue
-                key_part, value_part = line.split('": ', 1)
-                key = key_part.strip('"')
-                value_str = value_part.strip().rstrip(',').strip()
-                if value_str.startswith("[") and value_str.endswith("]"):
-                    try:
-                        value = [v.strip().strip('"') for v in value_str[1:-1].split(",")]
-                    except:
-                        value = value_str
-                else:
-                    value = value_str.strip('"')
-                new_data[key] = value
+            if not first_output_done:
+                elem_task = asyncio.create_task(model_to_queue(policy_elements_prompt, elem_queue))
+            else:
+                elem_task = None
 
-            for k, v in new_data.items():
-                if k in merged_info and isinstance(merged_info[k], list) and isinstance(v, list):
-                    merged_info[k] = list(dict.fromkeys(merged_info[k] + v))
-                else:
-                    merged_info[k] = v
+            async def run_judgment():
+                cleaned_info = await std_task
+                sessions = load_sessions()
+                session = sessions.get(session_id, {})
+                records = session.get("records", [])
+                history_inputs = [
+                    rec.get("user_input_text", "").strip()
+                    for rec in records
+                    if rec.get("user_input_text") and rec["part_id"] == req.part_id
+                ]
+                history_inputs = list(dict.fromkeys(history_inputs))
 
-            cleaned = remove_empty_values(merged_info)
+                history_text = "\n".join(history_inputs)
+                print(f"=========== history_text======\n{history_text}")
+                print("===============================")
 
-            save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
-                                req.part_id,req.user_input_text)
-            logger.info(f"送给大模型的公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
-            return cleaned
+                judge_prompt = build_company_judgment_prompt(
+                    cleaned_info,
+                    policy_info,
+                    extra_user_inputs=history_text,
+                    check_mode=req.check_mode
+                )
 
-        std_task = asyncio.create_task(run_standardization())
+                await model_to_queue(judge_prompt, judge_queue)
 
-        if not first_output_done:
-            elem_task = asyncio.create_task(model_to_queue(policy_elements_prompt, elem_queue))
-        else:
-            elem_task = None
+            judge_task = asyncio.create_task(run_judgment())
 
-        async def run_judgment():
-            cleaned_info = await std_task
-            sessions = load_sessions()
-            session = sessions.get(session_id, {})
-            records = session.get("records", [])
-            history_inputs = [
-                rec.get("user_input_text", "").strip()
-                for rec in records
-                if rec.get("user_input_text") and rec["part_id"] == req.part_id
-            ]
-            history_inputs = list(dict.fromkeys(history_inputs))
+            async def typing_output(text: str) -> AsyncGenerator[Dict[str, Any], None]:
+                nonlocal choice_index
+                for i in range(0, len(text), 2):
+                    chunk_text = text[i:i + 2]
+                    yield PolicyStreamResponse(
+                        id=stream_id,
+                        model="qwen3_32b",
+                        created=created_ts,
+                        part_id=req.part_id,
+                        choices=[{
+                            "index": choice_index,
+                            "finish_reason": None,
+                            "message": {"content": chunk_text, "role": "assistant"}
+                        }]
+                    ).dict()
+                    choice_index += 1
+                    await asyncio.sleep(0.04)
 
-            history_text = "\n".join(history_inputs)
-            print(f"=========== history_text======\n{history_text}")
-            print("===============================")
+            if not first_output_done:
+                first_intro = (
+                    "欢迎进入智能帮办环节，我可以为您提供智能匹配、智能体检、智能填报等环节的申报全流程智能辅助服务，"
+                    "您可以点击此处查看为您推荐的相关申报政策。您也可以直接告诉我想要申报的政策，由我提供智能体检服务。\n"
+                    "下面展示申请专项政策要素：\n"
+                )
+                async for chunk in typing_output(first_intro):
+                    yield chunk
 
-            judge_prompt = build_company_judgment_prompt(
-                cleaned_info,
-                policy_info,
-                extra_user_inputs=history_text
+                while True:
+                    elem_chunk = await elem_queue.get()
+                    if elem_chunk is None:
+                        break
+                    yield PolicyStreamResponse(
+                        id=stream_id,
+                        model="qwen3_32b",
+                        created=created_ts,
+                        part_id=req.part_id,
+                        choices=[{
+                            "index": choice_index,
+                            "finish_reason": None,
+                            "message": {"content": elem_chunk, "role": "assistant"}
+                        }]
+                    ).dict()
+                    choice_index += 1
+
+                save_session_record(session_id, "", req.part_id)
+
+            second_intro = (
+                "经AI对政策申报要求与贵司画像特征智能分析，您当前还不满足政策申报条件，"
+                "还存在以下条件需要由您确认：\n"
             )
-
-            await model_to_queue(judge_prompt, judge_queue)
-
-        judge_task = asyncio.create_task(run_judgment())
-
-        async def typing_output(text: str) -> AsyncGenerator[Dict[str, Any], None]:
-            nonlocal choice_index
-            for i in range(0, len(text), 2):
-                chunk_text = text[i:i + 2]
-                yield PolicyStreamResponse(
-                    id=stream_id,
-                    model="qwen3_32b",
-                    created=created_ts,
-                    part_id=req.part_id,
-                    choices=[{
-                        "index": choice_index,
-                        "finish_reason": None,
-                        "message": {"content": chunk_text, "role": "assistant"}
-                    }]
-                ).dict()
-                choice_index += 1
-                await asyncio.sleep(0.04)
-
-        if not first_output_done:
-            first_intro = (
-                "欢迎进入智能帮办环节，我可以为您提供智能匹配、智能体检、智能填报等环节的申报全流程智能辅助服务，"
-                "您可以点击此处查看为您推荐的相关申报政策。您也可以直接告诉我想要申报的政策，由我提供智能体检服务。\n"
-                "下面展示申请专项政策要素：\n"
-            )
-            async for chunk in typing_output(first_intro):
+            async for chunk in typing_output(second_intro):
                 yield chunk
 
+            # 第二个缓冲区：收集大模型完整输出
+            judge_buffer = ""
+
             while True:
-                elem_chunk = await elem_queue.get()
-                if elem_chunk is None:
+                judge_chunk = await judge_queue.get()
+                if judge_chunk is None:
                     break
+                judge_buffer += judge_chunk
                 yield PolicyStreamResponse(
                     id=stream_id,
                     model="qwen3_32b",
@@ -372,28 +406,19 @@ async def check_policy(req: NewCheckRequest):
                     choices=[{
                         "index": choice_index,
                         "finish_reason": None,
-                        "message": {"content": elem_chunk, "role": "assistant"}
+                        "message": {"content": judge_chunk, "role": "assistant"}
                     }]
                 ).dict()
                 choice_index += 1
 
-            save_session_record(session_id, "", req.part_id)
+            # 解析 judge_buffer，判断是否全部满足
+            is_satisfied = False
+            # 清洗
+            normalized = judge_buffer.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
 
-        second_intro = (
-            "经AI对政策申报要求与贵司画像特征智能分析，您当前还不满足政策申报条件，"
-            "还存在以下条件需要由您确认：\n"
-        )
-        async for chunk in typing_output(second_intro):
-            yield chunk
+            if "不满足项：无" in normalized and "不确定项：无" in normalized:
+                is_satisfied = True
 
-        # 第二个缓冲区：收集大模型完整输出
-        judge_buffer = ""
-
-        while True:
-            judge_chunk = await judge_queue.get()
-            if judge_chunk is None:
-                break
-            judge_buffer += judge_chunk
             yield PolicyStreamResponse(
                 id=stream_id,
                 model="qwen3_32b",
@@ -401,37 +426,90 @@ async def check_policy(req: NewCheckRequest):
                 part_id=req.part_id,
                 choices=[{
                     "index": choice_index,
-                    "finish_reason": None,
-                    "message": {"content": judge_chunk, "role": "assistant"}
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "",
+                        "role": "assistant",
+                        "is_satisfied": str(is_satisfied).lower()
+                    }
                 }]
             ).dict()
-            choice_index += 1
 
-        # 解析 judge_buffer，判断是否全部满足
-        is_satisfied = False
-        # 清洗
-        normalized = judge_buffer.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
+        return await chunked_response(event_stream())
 
-        if "不满足项：无" in normalized and "不确定项：无" in normalized:
-            is_satisfied = True
+    else:
+        if not req.session_id or not req.session_id.strip():
+            raise HTTPException(status_code=400, detail="必须传入 session_id")
 
-        yield PolicyStreamResponse(
-            id=stream_id,
-            model="qwen3_32b",
-            created=created_ts,
-            part_id=req.part_id,
-            choices=[{
-                "index": choice_index,
-                "finish_reason": "stop",
-                "message": {
-                    "content": "",
-                    "role": "assistant",
-                    "is_satisfied": str(is_satisfied).lower()
-                }
-            }]
-        ).dict()
+        policy_info = get_policy_info(req.part_id)
+        if "error" in policy_info:
+            raise HTTPException(status_code=404, detail='未找到该申报专项政策ID。')
 
-    return await chunked_response(event_stream())
+        session_id = req.session_id
+        choice_index = 0
+
+        async def event_stream() -> AsyncGenerator[Dict[str, Any], None]:
+            nonlocal choice_index
+            stream_id = str(uuid.uuid4())
+            created_ts = int(time.time())
+
+            # 获取最新公司信息
+            sessions = load_sessions()
+            records = sessions.get(session_id, {}).get("records", [])
+            if records:
+                try:
+                    last_record = next(rec for rec in reversed(records) if rec.get("content"))
+                    merged_info = json.loads(last_record["content"])
+                except Exception:
+                    merged_info = req.metadata.dict().copy()
+            else:
+                merged_info = req.metadata.dict().copy()
+            merged_info = remove_empty_values(merged_info)
+
+            # 收集历史输入
+            history_inputs = [
+                rec.get("user_input_text", "").strip()
+                for rec in records
+                if rec.get("user_input_text") and rec["part_id"] == req.part_id
+            ]
+            history_text = "\n".join(list(dict.fromkeys(history_inputs)))
+
+            judge_prompt = build_company_judgment_prompt(
+                merged_info,
+                policy_info,
+                extra_user_inputs=history_text,
+                check_mode=req.check_mode
+            )
+
+            # 流式发送大模型判断结果
+            async for chunk in stream_model_response(judge_prompt):
+                yield PolicyStreamResponse(
+                    id=stream_id,
+                    model="qwen3_32b",
+                    created=created_ts,
+                    part_id=req.part_id,
+                    choices=[{
+                        "index": choice_index,
+                        "finish_reason": None,
+                        "message": {"content": chunk, "role": "assistant"}
+                    }]
+                ).dict()
+                choice_index += 1
+
+            # 最终 stop
+            yield PolicyStreamResponse(
+                id=stream_id,
+                model="qwen3_32b",
+                created=created_ts,
+                part_id=req.part_id,
+                choices=[{
+                    "index": choice_index,
+                    "finish_reason": "stop",
+                    "message": {"content": "", "role": "assistant"}
+                }]
+            ).dict()
+
+        return await chunked_response(event_stream())
 
 
 if __name__ == '__main__':
