@@ -424,6 +424,8 @@ async def check_policy(req: NewCheckRequest):
                 }]
             ).dict()
 
+
+
     return await chunked_response(event_stream())
 
 
