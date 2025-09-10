@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 API_URL = "http://192.168.2.233:58000/v1/chat/completions"
-SESSIONS_FILE = "sessions.json"
+SESSIONS_FILE = "data/sessions.json"
 MAX_RECORDS = 100
 EXPIRY_HOURS = 1
 
@@ -151,9 +151,9 @@ class LLMClient:
             "model": "qwen3_32b",
             "messages": [{"role": "user", "content": prompt}],
             "chat_template_kwargs": {"enable_thinking": False},
-            "temperature": 0.25,
-            "top_k": 3,
-            "top_p": 0.9,
+            "temperature": 0.3,
+            # "top_k": 5,
+            "top_p": 0.3,
             "stream": True
         }
         buffer = ""
