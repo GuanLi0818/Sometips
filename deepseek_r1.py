@@ -15,6 +15,8 @@ import asyncio
 import time
 import os
 from contextlib import asynccontextmanager
+
+from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
 from company_info import CompanyInfo
 from policy_utils import get_policy_info
@@ -50,154 +52,183 @@ class PolicyStreamResponse(BaseModel):
 
 
 # -------------------------- Session 存储与清理 --------------------------
-def load_sessions() -> Dict[str, Any]:
-    if not os.path.exists(SESSIONS_FILE):
-        return {}
-    try:
-        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+class BaseUtils:
+    @staticmethod
+    def remove_empty_values(data: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned_data = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            elif isinstance(value, list) and len(value) == 0:
+                continue
+            elif isinstance(value, str) and value.strip() == "":
+                continue
+            cleaned_data[key] = value
+        return cleaned_data
 
-def save_sessions(sessions: Dict[str, Any]):
-    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(sessions, f, ensure_ascii=False, indent=2)
-
-def save_session_record(session_id: str, merged_info: str, part_id: str,user_input_text: Optional[str] = None):
-    if not merged_info:
-        return
-    now = time.time()
-    sessions = load_sessions()
-    cleanup_sessions(sessions)
-    if session_id not in sessions:
-        sessions[session_id] = {"records": [], "last_update": now}
-    session = sessions[session_id]
-
-    first_done = not any(rec["part_id"] == part_id for rec in session["records"])
-
-    session["records"].append({
-        "role": "user",
-        "user_input_text": user_input_text,
-        "content": merged_info,
-        "part_id": part_id,
-        "first_output_done": first_done
-    })
-    if len(session["records"]) > MAX_RECORDS:
-        session["records"] = session["records"][-MAX_RECORDS:]
-    session["last_update"] = now
-    save_sessions(sessions)
-
-def check_first_output_done(session_id: str, part_id: str) -> bool:
-    sessions = load_sessions()
-    for rec in sessions.get(session_id, {}).get("records", []):
-        if rec["part_id"] == part_id:
-            return rec.get("first_output_done", False)
-    return False
-
-def cleanup_sessions(sessions: Optional[Dict[str, Any]] = None):
-    if sessions is None:
-        sessions = load_sessions()
-    now = time.time()
-    expired = [sid for sid, data in sessions.items()
-               if now - data.get("last_update", 0) > EXPIRY_HOURS * 3600]
-    for sid in expired:
-        del sessions[sid]
-    save_sessions(sessions)
-    if expired:
-        logger.info(f"定期清理 session 完成，删除 {len(expired)} 个过期 session")
-
-async def periodic_cleanup(interval_hours: float = 1):
-    while True:
-        cleanup_sessions()
-        await asyncio.sleep(interval_hours * 3600)  # 每小时执行一次
-
-# -------------------------- FastAPI lifespan --------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    asyncio.create_task(periodic_cleanup(interval_hours=1))
-    yield
-app = FastAPI(lifespan=lifespan)
-
-
-# -------------------------- 大模型调用 --------------------------
-async def stream_model_response(prompt: str, buffer_size: int = 2, flush_interval: float = 0.05) -> AsyncGenerator[str, None]:
-    payload = {
-        "model": "deepseek-v3",
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": True
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {API_KEY}"
-    }
-    buffer = ""
-    finished = False
-
-    async def fetch_model():
-        nonlocal buffer, finished
+    @staticmethod
+    def load_json(file: str) -> Dict[str, Any]:
+        if not os.path.exists(file):
+            return {}
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("POST", API_URL, json=payload, headers=headers) as response:
-                    async for line_bytes in response.aiter_lines():
-                        if not line_bytes or not line_bytes.startswith("data:"):
-                            continue
-                        line_str = line_bytes[len("data:"):].strip()
-                        if not line_str:
-                            continue
-                        try:
-                            data = json.loads(line_str)
-                            delta = data["choices"][0]["delta"].get("content", "")
-                            if delta:
-                                buffer += delta
-                            finish_reason = data["choices"][0].get("finish_reason")
-                            if finish_reason == "stop":
-                                finished = True
-                                break
-                        except json.JSONDecodeError:
-                            continue
-        except httpx.RequestError:
-            buffer += "[模型服务请求失败]"
-            finished = True
+            with open(file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
-    fetch_task = asyncio.create_task(fetch_model())
+    @staticmethod
+    def save_json(file: str, data: Dict[str, Any]):
+        with open(file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
-    try:
-        while not finished or buffer:
-            if buffer:
-                out, buffer = buffer[:buffer_size], buffer[buffer_size:]
-                yield out
-            await asyncio.sleep(flush_interval)
-        yield "\n"
-    finally:
-        fetch_task.cancel()
-        await asyncio.sleep(0)
+baseutils =  BaseUtils()
+# -------------------------- 会话管理类 --------------------------
+class SessionManager:
+    def __init__(self, file_path: str = SESSIONS_FILE, max_records: int = MAX_RECORDS, expiry_hours: int = EXPIRY_HOURS):
+        self.file_path = file_path
+        self.max_records = max_records
+        self.expiry_hours = expiry_hours
 
-#调用大模型标准化公司信息
-async def collect_model_output(prompt: str) -> str:
-    result = ""
-    async for chunk in stream_model_response(prompt, buffer_size=64, flush_interval=0.02):
-        result += chunk
-    return result.strip()
+    def load_sessions(self) -> Dict[str, Any]:
+        return baseutils.load_json(self.file_path)
 
-def remove_empty_values(data: Dict[str, Any]) -> Dict[str, Any]:
-    cleaned_data = {}
-    for key, value in data.items():
-        if value is None:
-            continue
-        elif isinstance(value, list) and len(value) == 0:
-            continue
-        elif isinstance(value, str) and value.strip() == "":
-            continue
-        cleaned_data[key] = value
-    return cleaned_data
+    def save_sessions(self, sessions: Dict[str, Any]):
+        baseutils.save_json(self.file_path, sessions)
 
+    def save_session_record(self, session_id: str, merged_info: str, part_id: str, user_input_text: Optional[str] = None):
+        if not merged_info:
+            return
+        now = time.time()
+        sessions = self.load_sessions()
+        self.cleanup_sessions(sessions)
+
+        if session_id not in sessions:
+            sessions[session_id] = {"records": [], "last_update": now}
+        session = sessions[session_id]
+
+        first_done = not any(rec["part_id"] == part_id for rec in session["records"])
+        session["records"].append({
+            "role": "user",
+            "user_input_text": user_input_text,
+            "content": merged_info,
+            "part_id": part_id,
+            "first_output_done": first_done
+        })
+        if len(session["records"]) > self.max_records:
+            session["records"] = session["records"][-self.max_records:]
+        session["last_update"] = now
+        self.save_sessions(sessions)
+
+    def check_first_output_done(self, session_id: str, part_id: str) -> bool:
+        sessions = self.load_sessions()
+        for rec in sessions.get(session_id, {}).get("records", []):
+            if rec["part_id"] == part_id:
+                return rec.get("first_output_done", False)
+        return False
+
+    def cleanup_sessions(self, sessions: Optional[Dict[str, Any]] = None):
+        if sessions is None:
+            sessions = self.load_sessions()
+        now = time.time()
+        expired = [sid for sid, data in sessions.items()
+                   if now - data.get("last_update", 0) > self.expiry_hours * 3600]
+        for sid in expired:
+            del sessions[sid]
+        self.save_sessions(sessions)
+        if expired:
+            logger.info(f"定期清理 session 完成，删除 {len(expired)} 个过期 session")
+
+    async def periodic_cleanup(self, interval_hours: float = 1):
+        while True:
+            self.cleanup_sessions()
+            await asyncio.sleep(interval_hours * 3600)
+
+# -------------------------- 大模型调用类 --------------------------
+class LLMClient:
+    def __init__(self, api_url: str = API_URL):
+        self.api_url = api_url
+
+    async def stream_model_response(self, prompt: str, buffer_size: int = 2, flush_interval: float = 0.04) -> AsyncGenerator[str, None]:
+        payload = {
+            "model": "qwen3_32b",
+            "messages": [{"role": "user", "content": prompt}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "temperature": 0.25,
+            "top_k": 3,
+            "top_p": 0.9,
+            "stream": True
+        }
+        buffer = ""
+        finished = False
+
+        async def fetch_model():
+            nonlocal buffer, finished
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream("POST", self.api_url, json=payload) as response:
+                        async for line_bytes in response.aiter_lines():
+                            if not line_bytes or not line_bytes.startswith("data:"):
+                                continue
+                            line_str = line_bytes[len("data:"):].strip()
+                            if not line_str:
+                                continue
+                            try:
+                                data = json.loads(line_str)
+                                delta = data["choices"][0]["delta"].get("content", "")
+                                if delta:
+                                    buffer += delta
+                                if data["choices"][0].get("finish_reason") == "stop":
+                                    finished = True
+                                    break
+                            except json.JSONDecodeError:
+                                continue
+            except httpx.RequestError:
+                buffer += "[模型服务请求失败]"
+                finished = True
+
+        fetch_task = asyncio.create_task(fetch_model())
+        try:
+            while not finished or buffer:
+                if buffer:
+                    out, buffer = buffer[:buffer_size], buffer[buffer_size:]
+                    yield out
+                await asyncio.sleep(flush_interval)
+            yield "\n"
+        finally:
+            fetch_task.cancel()
+            await asyncio.sleep(0)
+
+    async def collect_model_output(self, prompt: str) -> str:
+        result = ""
+        async for chunk in self.stream_model_response(prompt, buffer_size=64, flush_interval=0.02):
+            result += chunk
+        return result.strip()
+
+# -------------------------- SSE流式响应 --------------------------
 async def chunked_response(generator: AsyncGenerator[Dict[str, Any], None]):
     async def iterate():
-        async for text_dict in generator:
-            text_bytes = json.dumps(text_dict, ensure_ascii=False).encode("utf-8")
-            output = b"data:" + text_bytes + b"\n\n"
-            yield output
+        async for resp_dict in generator:
+            resp_bytes = json.dumps(resp_dict, ensure_ascii=False).encode("utf-8")
+            yield b"data:" + resp_bytes + b"\n\n"
     return StreamingResponse(iterate(), media_type="text/event-stream")
+
+# -------------------------- FastAPI应用 --------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(session_manager.periodic_cleanup(interval_hours=0.5))
+    yield
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+session_manager = SessionManager()
+llm_client = LLMClient()
 
 
 # -------------------------- API --------------------------
@@ -226,7 +257,7 @@ async def check_policy(req: NewCheckRequest):
             nonlocal choice_index
             stream_id = str(uuid.uuid4())
             created_ts = int(time.time())
-            first_output_done = check_first_output_done(session_id, req.part_id)
+            first_output_done = session_manager.check_first_output_done(session_id, req.part_id)
 
             #标记
             yield PolicyStreamResponse(
@@ -245,21 +276,21 @@ async def check_policy(req: NewCheckRequest):
             judge_queue: asyncio.Queue[str] = asyncio.Queue()
 
             async def model_to_queue(prompt: str, queue: asyncio.Queue):
-                async for chunk in stream_model_response(prompt):
+                async for chunk in llm_client.stream_model_response(prompt):
                     await queue.put(chunk)
                 await queue.put(None)
 
             async def run_standardization() -> Dict[str, Any]:
                 merged_info = req.metadata.dict().copy()
                 if not req.user_input_text or not req.user_input_text.strip():
-                    cleaned = remove_empty_values(merged_info)
+                    cleaned = baseutils.remove_empty_values(merged_info)
                     logger.info(f"原始公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
-                    save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
+                    session_manager.save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
                                         req.part_id, req.user_input_text)
                     return cleaned
 
                 std_prompt = build_company_standardization_prompt(req.user_input_text)
-                std_result = await collect_model_output(std_prompt)
+                std_result = await llm_client.collect_model_output(std_prompt)
                 new_data = {}
                 for line in std_result.splitlines():
                     line = line.strip()
@@ -282,8 +313,8 @@ async def check_policy(req: NewCheckRequest):
                         merged_info[k] = list(dict.fromkeys(merged_info[k] + v))
                     else:
                         merged_info[k] = v
-                cleaned = remove_empty_values(merged_info)
-                save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
+                cleaned = baseutils.remove_empty_values(merged_info)
+                session_manager.save_session_record(session_id, json.dumps(cleaned, ensure_ascii=False),
                                     req.part_id,req.user_input_text)
                 logger.info(f"送给大模型的公司信息：{json.dumps(cleaned, ensure_ascii=False, indent=2)}")
                 return cleaned
@@ -297,7 +328,7 @@ async def check_policy(req: NewCheckRequest):
 
             async def run_judgment():
                 cleaned_info = await std_task
-                sessions = load_sessions()
+                sessions = session_manager.load_sessions()
                 session = sessions.get(session_id, {})
                 records = session.get("records", [])
                 history_inputs = [
@@ -367,7 +398,7 @@ async def check_policy(req: NewCheckRequest):
                     ).dict()
                     choice_index += 1
 
-                save_session_record(session_id, "", req.part_id)
+                session_manager.save_session_record(session_id, "", req.part_id)
 
 
             # ---------- 后续输出 ----------
@@ -447,7 +478,7 @@ async def check_policy(req: NewCheckRequest):
             created_ts = int(time.time())
 
             # 获取最新公司信息
-            sessions = load_sessions()
+            sessions = session_manager.load_sessions()
             records = sessions.get(session_id, {}).get("records", [])
             if records:
                 try:
@@ -457,7 +488,7 @@ async def check_policy(req: NewCheckRequest):
                     merged_info = req.metadata.dict().copy()
             else:
                 merged_info = req.metadata.dict().copy()
-            merged_info = remove_empty_values(merged_info)
+            merged_info = baseutils.remove_empty_values(merged_info)
 
             # 收集历史输入
             history_inputs = [
@@ -475,7 +506,7 @@ async def check_policy(req: NewCheckRequest):
             )
 
             # 流式发送大模型判断结果
-            async for chunk in stream_model_response(judge_prompt):
+            async for chunk in llm_client.stream_model_response(judge_prompt):
                 yield PolicyStreamResponse(
                     id=stream_id,
                     model="deepseek-v3",
@@ -507,4 +538,4 @@ async def check_policy(req: NewCheckRequest):
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app="main17:app", workers=1, host="0.0.0.0", port=8001, reload=False)
+    uvicorn.run(app="deepseek_r1:app", workers=1, host="0.0.0.0", port=8001, reload=False)
