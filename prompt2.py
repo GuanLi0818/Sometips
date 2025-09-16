@@ -6,13 +6,8 @@
 """
 
 from typing import List, Dict, Any, Optional
-from policy_utils import get_policy_info, parts, ori_data
-import json
+from policy_utils import get_policy_info,get_policy_object,get_policy_domain,get_policy_condition,get_policy_filename, format_polict_text
 
-policy_file_name_cache = {
-    pid: pdata.get("file_name", f"政策 {pid}")
-    for pid, pdata in ori_data.get("debug_data", {}).get("policy_toolbox_parts", {}).items()
-}
 
 
 def empty_company_info_dict() -> Dict[str, Any]:
@@ -46,10 +41,10 @@ def empty_company_info_dict() -> Dict[str, Any]:
     }
 
 
-def build_policy_elements_prompt(part_id: str, policy_info: Dict[str, Any]) -> str:
-    policy_name = policy_file_name_cache.get(part_id, f"政策 {part_id}")
-    policy_text_lines = [f"{key}: {value}" for key, value in policy_info.items()]
-    policy_text = "\n".join(policy_text_lines)
+def build_policy_elements_prompt(part_id: str) -> str:
+    policy_name = get_policy_filename(part_id)
+    policy_text = format_polict_text(part_id)
+
     prompt = f"""
 
         请根据以下要求生成输出：
@@ -77,22 +72,20 @@ def build_policy_elements_prompt(part_id: str, policy_info: Dict[str, Any]) -> s
 
 
 def build_company_judgment_prompt(
+        part_id: str,
         company_info: Dict[str, Any],
-        policy_info: Dict[str, Any],
         extra_user_inputs: str = "",
         check_mode: int = 1
 ) -> str | None:
     """
     构建企业政策判断的提示词
     :param company_info: 企业信息字典
-    :param policy_info: 政策条款字典
     :param extra_user_inputs: 用户原始输入文本
     :param check_mode: 判断模式，1=保留原逻辑，2=只输出政策原文，满足/不满足/不确定
     :return: LLM提示词
     """
     company_info_text = "\n".join(f"{k}: {v}" for k, v in company_info.items())
-    policy_text_lines = [f"{k}: {v}" for k, v in policy_info.items()]
-    policy_text = "\n".join(policy_text_lines)
+    policy_text = format_polict_text(part_id)
 
     # check_mode=1 提示词：原有逻辑
     if check_mode == 1:
@@ -100,7 +93,7 @@ def build_company_judgment_prompt(
             你是一位精通政府政策解读和企业合规分析的专家。
             你的任务是根据企业信息和政策条款，判断企业是否符合申报条件，只输出“不满足/不确定”的条件及简短建议，不生成其他内容。
 
-            要求：
+            任务要求：
             1. 申报对象：重点关注字段：org、cap、size、regist_loc、tax_loc、description、extra_fields 等。
             2. 扶持领域：重点关注字段：key_focus_areas、industry、description、primary_product、tags、honors、extra_fields 等。
             3. 申报条件：逐条对照政策条款的申报条件，结合企业所有信息判断。
@@ -133,15 +126,6 @@ def build_company_judgment_prompt(
                     不确定项：无
                 - 不要输出其他任何前缀或说明文字。
 
-            政策条款：
-            {policy_text}
-
-            企业信息（以这个为准）：
-            {company_info_text}
-
-            用户原始输入（仅供参考）：
-            {extra_user_inputs}
-
             示例输出风格:
             不满足项：
             1. 企业税收户管不在浦东新区。
@@ -150,7 +134,16 @@ def build_company_judgment_prompt(
             不确定项：
             1. 是否存在尚未披露的股权结构情况。
             2. ...
+            
 
+            政策条款：
+            {policy_text}
+
+            企业信息（以这个为准）：
+            {company_info_text}
+
+            用户原始输入（仅供参考）：
+            {extra_user_inputs}
             """
         return base_prompt
 
@@ -198,36 +191,39 @@ def build_company_judgment_prompt(
             20. 控制总输出长度，一定要简短。
             21. 根据企业信息(regist_loc、org等)判断实际满足项，即使是默认满足也列出。
 
-            政策条款：
-            {policy_text}
-            
-            政策原文：
-                申报对象：{policy_info.get("申报对象", "")}
-                扶持领域：{policy_info.get("扶持领域", "")}
-                申报条件：{policy_info.get("申报条件", "")}
-
-            企业信息：
-            {company_info_text}
-
-            用户原始输入（仅供参考）：
-            {extra_user_inputs}
-
-            请根据企业信息逐条比对政策原文，输出时严格按以下顺序和格式组织：
-
-            1. 输出“申报对象：”+ 政策原文；
-               换行后输出“满足项：”+ 与申报对象相关的满足项（若无则写“无”）。
-            2. 输出“扶持领域：”+ 政策原文；
-               换行后输出“满足项：”+ 与扶持领域相关的满足项（若无则写“无”）。
-            3. 输出“申报条件：”+ 政策原文；
-               换行后输出“满足项：”+ 与申报条件相关的满足项（若无则写“无”）。
-            4. 最后统一输出：
+            任务：
+            1. 严格对照企业信息和政策原文。
+            2. 输出时必须严格按照以下顺序和格式：
+               1) 输出“申报对象：”后，逐字照抄下面提供的政策原文（不要改写，不要省略，必须一字不差）。
+                  然后换行，输出“满足项：”+ 与申报对象相关的满足项（若无则写“无”）。
+               2) 输出“扶持领域：”后，逐字照抄下面提供的政策原文（不要改写，不要省略，必须一字不差）。
+                  然后换行，输出“满足项：”+ 与扶持领域相关的满足项（若无则写“无”）。
+               3) 输出“申报条件：”后，逐字照抄下面提供的政策原文（不要改写，不要省略，必须一字不差）。
+                  然后换行，输出“满足项：”+ 与申报条件相关的满足项（若无则写“无”）。
+            3. 最后统一输出全部的不满足项（需要换行）：
                不满足项：...
                不确定项：...
             
-            注意：
-            - 满足项必须紧扣企业信息，避免泛化。
-            - 不满足项与不确定项不要在前面拆开写，只能在最后统一输出。
-            - 不要生成任何解释说明。
+            严格要求：
+            - 「政策原文」必须逐字输出，和输入保持完全一致，不允许生成解释或改写。
+            - 「满足项」必须基于企业信息，紧扣原文，避免泛化。
+            - 不满足项和不确定项只在最后统一输出。
+            - 输出为纯文本，不要 JSON、符号或解释说明。
+            
+            政策原文：
+            申报对象：{get_policy_object(part_id)}
+            扶持领域：{get_policy_domain(part_id)}
+            申报条件：{get_policy_condition(part_id)}
+            
+            
+            政策条款：
+            {policy_text}
+            
+            企业信息：
+            {company_info_text}
+            
+            用户原始输入（仅供参考）：
+            {extra_user_inputs}
             
             
             """
@@ -285,7 +281,7 @@ def build_company_standardization_prompt(user_input: str) -> str:
 
 
         ###  业务领域（列表字段）
-        - "industry": 所属行业,（如["信息传输、软件和信息技术服务业", "制造业"]）
+        - "industry": 三级行业名,（如["信息传输、软件和信息技术服务业", "技术推广服务"]）
         - "primary_product": 主要产品（如["智能眼镜", "智能眼镜配件"]）
         - "key_focus_areas": 重点技术领域（如["人工智能", "生物医药", "集成电路"]）
 
