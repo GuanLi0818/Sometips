@@ -179,21 +179,28 @@ if __name__ == "__main__":
     # print(f"已完成，共生成 {len(samples)} 条样本。")
     #
 
+    num_samples = 3
+
     with open('part_id.txt', 'r',encoding='utf-8') as f:
         part_ids = f.readlines()
-        part_id_list = [i.strip() for i in part_ids][:3]
+        part_id_list = [i.strip() for i in part_ids][:2]
 
+
+        total_target = len(part_id_list) * num_samples
         total = 0
-        for i, part_id in tqdm(enumerate(part_id_list, 1), total=len(part_id_list), desc="处理进度"):
+        with tqdm(total=total_target, desc="总样本生成进度") as pbar:
+            for part_id in part_id_list:
             # print(f"处理第{i}/{len(part_id_list)}个part_id：{part_id}")
 
-            samples = generate_finetune_policy_match_samples(
-                part_id=part_id,
-                ratio=0.5,
-                num_samples=3,
-                output_path="finetune_samples.jsonl"
-            )
-            total += len(samples)
+                samples = generate_finetune_policy_match_samples(
+                    part_id=part_id,
+                    ratio=0.6,
+                    num_samples=num_samples,
+                    output_path="finetune_samples.jsonl"
+                )
+                current_num = len(samples)
+                total += current_num
+                pbar.update(current_num)
 
 
         print(f"全部处理完成！共处理{len(part_id_list)}个part_id，生成{total}条样本，保存至：finetune_samples.jsonl")
